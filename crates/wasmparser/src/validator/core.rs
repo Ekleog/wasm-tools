@@ -478,13 +478,8 @@ impl Module {
             check_max(self.types.len(), 1, MAX_WASM_TYPES, "types", offset)?;
         }
 
-        self.types.push(TypeId::new(
-            ty.type_size(),
-            types.len(),
-            Some(self.types.len()),
-            true,
-        ));
-        types.push(ty);
+        let id = types.push_ty(offset, ty, self.types.len())?;
+        self.types.push(id);
         Ok(())
     }
 

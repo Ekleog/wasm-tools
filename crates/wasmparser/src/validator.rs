@@ -1213,7 +1213,7 @@ impl Validator {
                 // If there's a parent component, pop the stack, add it to the parent,
                 // and continue to validate the component
                 if let Some(parent) = self.components.last_mut() {
-                    parent.add_component(&mut component, &mut self.types);
+                    parent.add_component(&mut component, &mut self.types, offset)?;
                     self.state = State::Component;
                 }
 

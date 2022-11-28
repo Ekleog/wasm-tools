@@ -3,8 +3,8 @@
 use super::{component::ComponentState, core::Module};
 use crate::{
     ComponentExport, ComponentExternalKind, ComponentImport, ComponentTypeRef, Export,
-    ExternalKind, FuncType, GlobalType, Import, MemoryType, PrimitiveValType, TableType, TypeRef,
-    ValType,
+    ExternalKind, FuncType, GlobalType, Import, MemoryType, PrimitiveValType, Result, TableType,
+    TypeRef, ValType,
 };
 use indexmap::{IndexMap, IndexSet};
 use std::{
@@ -132,54 +132,112 @@ fn push_primitive_wasm_types(ty: &PrimitiveValType, lowered_types: &mut LoweredT
 }
 
 /// Represents a unique identifier for a type known to a [`crate::Validator`].
+//
+// Internally a type id is represented as a bit-packed 64-bit integer to reflect
+// the limits in place during validation. The bits are defined as:
+//
+//
+// *  0-19 - the index in the global type list
+// * 20-36 - the type size
+// *    37 - whether a type index is present
+// * 38-57 - the type index, or zero if not present
+// *    58 - whether or not this is a core type or not
+//
+// Bits 37 and onwards are purely used for PartialEq/Hash to ensure that two
+// intern'd types don't equate to the same value if they are present at
+// different indices.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct TypeId {
-    /// The effective type size for the type.
-    ///
-    /// This is stored as part of the ID to avoid having to recurse through
-    /// the global type list when calculating type sizes.
-    pub(crate) type_size: usize,
-    /// The index into the global list of types.
-    pub(crate) index: usize,
-    /// Metadata about the type hash, used to avoid two isomorphic types from
-    /// being considered as equal for Eq and Hash.
-    ///
-    /// This contains:
-    /// - Bit (1 << 63): True iff the type is a core type
-    /// - Bit (1 << 62): False iff the type is implicitly defined, eg. types
-    ///   for module definitions, component definitions, instantiations and
-    ///   function lowerings.
-    /// - Other bits: if (1 << 62) is not true, then the type index
-    pub(crate) type_hash: u64,
-}
+pub struct TypeId(u64);
+
+const INDEX_BITS: usize = 20;
+const TYPE_SIZE_BITS: usize = 17;
+const TYPE_INDEX_BITS: usize = 20;
+
+const INDEX_OFFSET: usize = 0;
+const TYPE_SIZE_OFFSET: usize = INDEX_OFFSET + INDEX_BITS;
+const TYPE_INDEX_PRESENT_OFFSET: usize = TYPE_SIZE_OFFSET + TYPE_SIZE_BITS;
+const TYPE_INDEX_OFFSET: usize = TYPE_INDEX_PRESENT_OFFSET + 1;
+const IS_CORE_OFFSET: usize = TYPE_INDEX_OFFSET + TYPE_INDEX_BITS;
 
 impl TypeId {
     pub(crate) fn new(
+        offset: usize,
         type_size: usize,
         index: usize,
         type_index: Option<usize>,
         is_core: bool,
-    ) -> TypeId {
-        let mut type_hash = 0;
-        if is_core {
-            type_hash |= 1 << 63;
+    ) -> Result<TypeId> {
+        let mut bits = 0;
+        if type_size >= (1 << TYPE_SIZE_BITS) {
+            bail!(offset, "type size is too large");
         }
+        bits |= (type_size as u64) << TYPE_SIZE_OFFSET;
+
+        if index >= (1 << INDEX_BITS) {
+            bail!(offset, "index is too large");
+        }
+        bits |= (index as u64) << INDEX_OFFSET;
+
         if let Some(type_index) = type_index {
-            type_hash |= 1 << 62;
-            let type_index: u64 = type_index
-                .try_into()
-                .expect("failed converting usize to u64");
-            if type_index & (0b11 << 62) != 0 {
-                panic!("type index bigger than 2**62");
+            if type_index >= (1 << TYPE_INDEX_BITS) {
+                bail!(offset, "index is too large");
             }
-            type_hash |= type_index;
+            bits |= (type_index as u64) << TYPE_INDEX_OFFSET;
+            bits |= 1 << TYPE_INDEX_PRESENT_OFFSET;
         }
-        TypeId {
-            type_size,
-            index,
-            type_hash,
-        }
+
+        bits |= (is_core as u64) << IS_CORE_OFFSET;
+
+        Ok(TypeId(bits))
     }
+
+    pub(crate) fn with_type_index(&self, offset: usize, index: usize) -> Result<TypeId> {
+        TypeId::new(
+            offset,
+            self.type_size(),
+            self.index(),
+            Some(index),
+            self.is_core(),
+        )
+    }
+
+    #[inline]
+    fn type_size(&self) -> usize {
+        ((self.0 >> TYPE_SIZE_OFFSET) & ((1 << TYPE_SIZE_BITS) - 1)) as usize
+    }
+
+    #[inline]
+    fn index(&self) -> usize {
+        ((self.0 >> INDEX_OFFSET) & ((1 << INDEX_BITS) - 1)) as usize
+    }
+
+    #[inline]
+    fn is_core(&self) -> bool {
+        (self.0 & (1 << IS_CORE_OFFSET)) != 0
+    }
+}
+
+#[test]
+fn type_id_basics() {
+    let i1 = TypeId::new(0, 0, 0, None, false).unwrap();
+    assert_eq!(i1.type_size(), 0);
+    assert_eq!(i1.index(), 0);
+    assert!(!i1.is_core());
+
+    let i2 = TypeId::new(0, 100, 200, Some(4), true).unwrap();
+    assert_eq!(i2.type_size(), 100);
+    assert_eq!(i2.index(), 200);
+    assert!(i2.is_core());
+
+    assert!(i1 != i2);
+    let i3 = TypeId::new(0, 100, 200, Some(5), true).unwrap();
+    assert!(i3 != i2);
+    let i4 = TypeId::new(0, 100, 200, None, true).unwrap();
+    assert!(i4 != i2);
+
+    assert!(TypeId::new(0, 1 << TYPE_SIZE_BITS, 0, None, false).is_err());
+    assert!(TypeId::new(0, 0, 1 << INDEX_BITS, None, false).is_err());
+    assert!(TypeId::new(0, 0, 0, Some(1 << TYPE_INDEX_BITS), false).is_err());
 }
 
 /// A unified type definition for validating WebAssembly modules and components.
@@ -281,6 +339,16 @@ impl Type {
             Self::Defined(ty) => ty.type_size(),
         }
     }
+
+    fn is_core(&self) -> bool {
+        match self {
+            Self::Func(_) | Self::Module(_) | Self::Instance(_) => true,
+            Self::Component(_)
+            | Self::ComponentInstance(_)
+            | Self::ComponentFunc(_)
+            | Self::Defined(_) => false,
+        }
+    }
 }
 
 /// A component value type.
@@ -361,7 +429,7 @@ impl ComponentValType {
     pub(crate) fn type_size(&self) -> usize {
         match self {
             Self::Primitive(_) => 1,
-            Self::Type(id) => id.type_size,
+            Self::Type(id) => id.type_size(),
         }
     }
 }
@@ -433,7 +501,7 @@ impl EntityType {
 
     pub(crate) fn type_size(&self) -> usize {
         match self {
-            Self::Func(id) | Self::Tag(id) => id.type_size,
+            Self::Func(id) | Self::Tag(id) => id.type_size(),
             Self::Table(_) | Self::Memory(_) | Self::Global(_) => 1,
         }
     }
@@ -641,7 +709,7 @@ impl ComponentEntityType {
             | Self::Func(ty)
             | Self::Type(ty)
             | Self::Instance(ty)
-            | Self::Component(ty) => ty.type_size,
+            | Self::Component(ty) => ty.type_size(),
             Self::Value(ty) => ty.type_size(),
         }
     }
@@ -1210,7 +1278,7 @@ impl<'a> TypesRef<'a> {
     ///
     /// Returns `None` if the type id is unknown.
     pub fn type_from_id(&self, id: TypeId) -> Option<&'a Type> {
-        self.list.get(id.index)
+        self.list.get(id.index())
     }
 
     /// Gets a type id from a type index.
@@ -1898,6 +1966,20 @@ impl<T> SnapshotList<T> {
     }
 }
 
+impl SnapshotList<Type> {
+    pub(crate) fn push_ty(&mut self, offset: usize, ty: Type, idx: usize) -> Result<TypeId> {
+        let id = TypeId::new(offset, ty.type_size(), self.len(), Some(idx), ty.is_core())?;
+        self.push(ty);
+        Ok(id)
+    }
+
+    pub(crate) fn push_ty_anon(&mut self, offset: usize, ty: Type) -> Result<TypeId> {
+        let id = TypeId::new(offset, ty.type_size(), self.len(), None, ty.is_core())?;
+        self.push(ty);
+        Ok(id)
+    }
+}
+
 impl<T> std::ops::Index<usize> for SnapshotList<T> {
     type Output = T;
 
@@ -1919,14 +2001,14 @@ impl<T> std::ops::Index<TypeId> for SnapshotList<T> {
 
     #[inline]
     fn index(&self, id: TypeId) -> &T {
-        self.get(id.index).unwrap()
+        self.get(id.index()).unwrap()
     }
 }
 
 impl<T> std::ops::IndexMut<TypeId> for SnapshotList<T> {
     #[inline]
     fn index_mut(&mut self, id: TypeId) -> &mut T {
-        self.get_mut(id.index).unwrap()
+        self.get_mut(id.index()).unwrap()
     }
 }
 

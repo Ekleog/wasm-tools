@@ -84,13 +84,8 @@ impl ComponentState {
             check_max(current.type_count(), 1, MAX_WASM_TYPES, "types", offset)?;
         }
 
-        current.core_types.push(TypeId::new(
-            ty.type_size(),
-            types.len(),
-            Some(current.core_types.len()),
-            true,
-        ));
-        types.push(ty);
+        let id = types.push_ty(offset, ty, current.core_types.len())?;
+        current.core_types.push(id);
 
         Ok(())
     }
@@ -111,11 +106,8 @@ impl ComponentState {
             imports,
             exports: module.exports.clone(),
         });
-
-        self.core_modules
-            .push(TypeId::new(ty.type_size(), types.len(), None, true));
-
-        types.push(ty);
+        let id = types.push_ty_anon(offset, ty)?;
+        self.core_modules.push(id);
 
         Ok(())
     }
@@ -179,13 +171,8 @@ impl ComponentState {
             check_max(current.type_count(), 1, MAX_WASM_TYPES, "types", offset)?;
         }
 
-        current.types.push(TypeId::new(
-            ty.type_size(),
-            types.len(),
-            Some(current.types.len()),
-            false,
-        ));
-        types.push(ty);
+        let id = types.push_ty(offset, ty, current.types.len())?;
+        current.types.push(id);
 
         Ok(())
     }
@@ -325,26 +312,27 @@ impl ComponentState {
         self.check_options(None, &info, &options, types, offset)?;
 
         let lowered_ty = Type::Func(info.into_func_type());
-
-        self.core_funcs
-            .push(TypeId::new(lowered_ty.type_size(), types.len(), None, true));
-
-        types.push(lowered_ty);
+        let id = types.push_ty_anon(offset, lowered_ty)?;
+        self.core_funcs.push(id);
 
         Ok(())
     }
 
-    pub fn add_component(&mut self, component: &mut Self, types: &mut TypeList) {
+    pub fn add_component(
+        &mut self,
+        component: &mut Self,
+        types: &mut TypeList,
+        offset: usize,
+    ) -> Result<()> {
         let ty = Type::Component(ComponentType {
             type_size: component.type_size,
             imports: mem::take(&mut component.imports),
             exports: mem::take(&mut component.exports),
         });
 
-        self.components
-            .push(TypeId::new(ty.type_size(), types.len(), None, false));
-
-        types.push(ty);
+        let id = types.push_ty_anon(offset, ty)?;
+        self.components.push(id);
+        Ok(())
     }
 
     pub fn add_instance(
@@ -1003,12 +991,7 @@ impl ComponentState {
                 .fold(1, |acc, (_, ty)| acc + ty.type_size()),
             kind: InstanceTypeKind::Instantiated(module_type_id),
         });
-
-        let id = TypeId::new(ty.type_size(), types.len(), None, true);
-
-        types.push(ty);
-
-        Ok(id)
+        Ok(types.push_ty_anon(offset, ty)?)
     }
 
     fn instantiate_component(
@@ -1136,11 +1119,7 @@ impl ComponentState {
             kind: ComponentInstanceTypeKind::Instantiated(component_type_id),
         });
 
-        let id = TypeId::new(ty.type_size(), types.len(), None, false);
-
-        types.push(ty);
-
-        Ok(id)
+        Ok(types.push_ty_anon(offset, ty)?)
     }
 
     fn instantiate_exports(
@@ -1234,11 +1213,7 @@ impl ComponentState {
             kind: ComponentInstanceTypeKind::Exports(inst_exports),
         });
 
-        let id = TypeId::new(ty.type_size(), types.len(), None, false);
-
-        types.push(ty);
-
-        Ok(id)
+        Ok(types.push_ty_anon(offset, ty)?)
     }
 
     fn instantiate_core_exports(
@@ -1317,11 +1292,7 @@ impl ComponentState {
             kind: InstanceTypeKind::Exports(inst_exports),
         });
 
-        let id = TypeId::new(ty.type_size(), types.len(), None, true);
-
-        types.push(ty);
-
-        Ok(id)
+        Ok(types.push_ty_anon(offset, ty)?)
     }
 
     fn alias_core_instance_export(
@@ -1530,12 +1501,9 @@ impl ComponentState {
         let current = components.last_mut().unwrap();
         check_max(current.type_count(), 1, MAX_WASM_TYPES, "types", offset)?;
 
-        current.core_types.push(TypeId::new(
-            ty.type_size,
-            ty.index,
-            Some(current.core_types.len()),
-            true,
-        ));
+        current
+            .core_types
+            .push(ty.with_type_index(offset, current.core_types.len())?);
 
         Ok(())
     }
@@ -1547,12 +1515,9 @@ impl ComponentState {
         let current = components.last_mut().unwrap();
         check_max(current.type_count(), 1, MAX_WASM_TYPES, "types", offset)?;
 
-        current.types.push(TypeId::new(
-            ty.type_size,
-            ty.index,
-            Some(current.types.len()),
-            false,
-        ));
+        current
+            .types
+            .push(ty.with_type_index(offset, current.types.len())?);
 
         Ok(())
     }
@@ -1866,7 +1831,7 @@ impl ComponentState {
         let id = self.type_at(idx, false, offset)?;
         match &types[id] {
             Type::Defined(_) => Ok(id),
-            _ => bail!(offset, "type index {} is not a defined type", id.index),
+            _ => bail!(offset, "type index {} is not a defined type", idx),
         }
     }
 
